@@ -58,13 +58,22 @@ func (s *Server) HandleResponseBody(ctx context.Context, requestID string, req *
 
 	defer func() {
 		// Wrapped in a function to delay the evaluation of parameters. Using complete to make sure DoneRequestTrace only call once for a request.
-		if !hasCompleted && complete {
+		if !hasCompleted && complete && routerCtx != nil {
 			s.cache.DoneRequestTrace(routerCtx, requestID, model, promptTokens, completionTokens, traceTerm)
-			if routerCtx != nil {
-				routerCtx.Delete()
-			}
+			routerCtx.Delete()
 		}
 	}()
+
+	// Some routes (e.g. /metrics, /healthz direct_response, etc.) don't build a routing context.
+	// For those, skip token accounting and response parsing to avoid nil dereference.
+	if routerCtx == nil {
+		complete = b.ResponseBody.EndOfStream
+		return &extProcPb.ProcessingResponse{
+			Response: &extProcPb.ProcessingResponse_ResponseBody{
+				ResponseBody: &extProcPb.BodyResponse{Response: &extProcPb.CommonResponse{}},
+			},
+		}, complete
+	}
 
 	if stream {
 		t := &http.Response{
@@ -107,7 +116,7 @@ func (s *Server) HandleResponseBody(ctx context.Context, requestID string, req *
 		complete = true
 
 		// Count token per user.
-		if user.Name != "" {
+		if user.Name != "" && !loadEnvBool(EnvDisableRateLimit) {
 			tpm, err := s.ratelimiter.Incr(ctx, fmt.Sprintf("%v_TPM_CURRENT", user.Name), totalTokens)
 			if err != nil {
 				return generateErrorResponse(

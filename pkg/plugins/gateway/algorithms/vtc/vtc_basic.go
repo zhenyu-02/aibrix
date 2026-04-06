@@ -43,6 +43,9 @@ const (
 	VTC_OUTPUT_TOKEN_WEIGHT = "AIBRIX_ROUTER_VTC_BASIC_OUTPUT_TOKEN_WEIGHT"
 	VTC_FAIRNESS_WEIGHT     = "AIBRIX_ROUTER_VTC_BASIC_FAIRNESS_WEIGHT"
 	VTC_UTILIZATION_WEIGHT  = "AIBRIX_ROUTER_VTC_BASIC_UTILIZATION_WEIGHT"
+	// Optional: use (running + waiting) as pod load to make queueing visible to VTC.
+	// Default is false to keep backward compatibility.
+	VTC_UTILIZATION_INCLUDE_WAITING = "AIBRIX_ROUTER_VTC_BASIC_UTILIZATION_INCLUDE_WAITING"
 )
 
 var (
@@ -51,14 +54,16 @@ var (
 	outputTokenWeight = utils.LoadEnvFloat(VTC_OUTPUT_TOKEN_WEIGHT, defaultOutputTokenWeight)
 	fairnessWeight    = utils.LoadEnvFloat(VTC_FAIRNESS_WEIGHT, defaultFairnessWeight)
 	utilizationWeight = utils.LoadEnvFloat(VTC_UTILIZATION_WEIGHT, defaultUtilizationWeight)
+	utilizationIncludeWaiting = utils.LoadEnvBool(VTC_UTILIZATION_INCLUDE_WAITING, false)
 )
 
 // BasicVTCRouter implements the VTC routing algorithm
 type BasicVTCRouter struct {
-	cache          cache.MetricCache
-	tokenTracker   TokenTracker
-	tokenEstimator TokenEstimator
-	config         *VTCConfig
+	cache                   cache.MetricCache
+	outputPredictorProvider types.OutputPredictorProvider
+	tokenTracker            TokenTracker
+	tokenEstimator          TokenEstimator
+	config                  *VTCConfig
 }
 
 // NewBasicVTCRouter creates a new BasicVTCRouter with the provided token tracker and estimator
@@ -70,10 +75,11 @@ func NewBasicVTCRouter(tokenTracker TokenTracker, tokenEstimator TokenEstimator,
 	}
 
 	return &BasicVTCRouter{
-		cache:          c,
-		tokenTracker:   tokenTracker,
-		tokenEstimator: tokenEstimator,
-		config:         config,
+		cache:                   c,
+		outputPredictorProvider: c,
+		tokenTracker:            tokenTracker,
+		tokenEstimator:          tokenEstimator,
+		config:                  config,
 	}, nil
 }
 
@@ -93,6 +99,17 @@ func (r *BasicVTCRouter) Route(ctx *types.RoutingContext, readyPodList types.Pod
 
 	inputTokens := r.tokenEstimator.EstimateInputTokens(ctx.Message)
 	outputTokens := r.tokenEstimator.EstimateOutputTokens(ctx.Message)
+	if r.config != nil && r.config.Variant == RouterVTCPred {
+		promptLen, err := ctx.PromptLength()
+		if err != nil {
+			klog.ErrorS(err, "failed to get prompt length for vtc-pred")
+		} else {
+			inputTokens = float64(promptLen)
+			if predicted, ok := r.predictOutputTokens(ctx, promptLen); ok {
+				outputTokens = predicted
+			}
+		}
+	}
 
 	userTokens, err := r.tokenTracker.GetTokenCount(ctx.Context, *user)
 	if err != nil {
@@ -142,10 +159,26 @@ func (r *BasicVTCRouter) Route(ctx *types.RoutingContext, readyPodList types.Pod
 			pod.Name, ctx.Model,
 		)
 
-		// Apply clamped linear mapping: tokens / bucket_size, clamped to [0, npods-1]
-		normalizedTokens := math.Min(float64(userTokens)/adaptiveBucketSize, float64(len(readyPods)-1))
+		// Apply wrapped linear mapping: tokens / bucket_size, wrapped to [0, npods)
+		//
+		// NOTE: The previous clamped mapping would saturate at (npods-1) once userTokens grows large,
+		// causing many users to be routed to the last pod and amplifying queueing. Wrapping keeps the
+		// monotonic progression while preventing permanent saturation.
+		normalizedTokens := 0.0
+		if adaptiveBucketSize > 0 && len(readyPods) > 0 {
+			normalizedTokens = math.Mod(float64(userTokens)/adaptiveBucketSize, float64(len(readyPods)))
+			if normalizedTokens < 0 {
+				normalizedTokens += float64(len(readyPods))
+			}
+		}
 
-		fairnessScore := math.Abs(float64(i) - normalizedTokens)
+		// Circular distance on the ring: min(|i-x|, n-|i-x|)
+		n := float64(len(readyPods))
+		diff := math.Abs(float64(i) - normalizedTokens)
+		fairnessScore := diff
+		if n > 0 {
+			fairnessScore = math.Min(diff, n-diff)
+		}
 
 		klog.InfoS("VTC token normalization details",
 			"user", *user,
@@ -158,6 +191,7 @@ func (r *BasicVTCRouter) Route(ctx *types.RoutingContext, readyPodList types.Pod
 			"fairnessScore", fairnessScore)
 
 		// 2. Get pod load for utilization score
+		// Default: running requests. Optionally include waiting requests to reflect queueing.
 		var podLoad float64
 		if r.cache != nil {
 			reqCount, err := r.cache.GetMetricValueByPodModel(pod.Name, pod.Namespace, ctx.Model, metrics.NumRequestsRunning)
@@ -166,6 +200,14 @@ func (r *BasicVTCRouter) Route(ctx *types.RoutingContext, readyPodList types.Pod
 				podLoad = 0
 			} else {
 				podLoad = reqCount.GetSimpleValue()
+			}
+			if utilizationIncludeWaiting {
+				waitingCount, err := r.cache.GetMetricValueByPodModel(pod.Name, pod.Namespace, ctx.Model, metrics.NumRequestsWaiting)
+				if err != nil {
+					klog.ErrorS(err, "failed to get pod waiting metrics, ignoring", "pod", pod.Name)
+				} else {
+					podLoad += waitingCount.GetSimpleValue()
+				}
 			}
 		} else {
 			klog.Info("Cache is nil, using default pod load value")
@@ -219,8 +261,28 @@ func (r *BasicVTCRouter) Route(ctx *types.RoutingContext, readyPodList types.Pod
 }
 
 func (r *BasicVTCRouter) SubscribedMetrics() []string {
+	if utilizationIncludeWaiting {
+		return []string{
+			metrics.NumRequestsRunning,
+			metrics.NumRequestsWaiting,
+			metrics.VTCBucketSizeActive,
+		}
+	}
 	return []string{
 		metrics.NumRequestsRunning,
 		metrics.VTCBucketSizeActive,
 	}
+}
+
+func (r *BasicVTCRouter) predictOutputTokens(ctx *types.RoutingContext, promptLen int) (float64, bool) {
+	if r.outputPredictorProvider == nil {
+		return 0, false
+	}
+	predictor, err := r.outputPredictorProvider.GetOutputPredictor(ctx.Model)
+	if err != nil {
+		klog.ErrorS(err, "failed to get output predictor for vtc-pred", "model", ctx.Model)
+		return 0, false
+	}
+	ctx.SetOutputPreditor(predictor)
+	return float64(predictor.Predict(promptLen)), true
 }

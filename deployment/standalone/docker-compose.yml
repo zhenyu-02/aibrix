@@ -227,6 +227,9 @@ services:
       REDIS_PORT: "6379"
       # Routing algorithm: random, least_request, prefix_cache_aware, pd (for P/D mode)
       AIBRIX_ROUTING_ALGORITHM: ${ROUTING_ALGORITHM:-least_request}
+      # VTC bucket sizing (only used when AIBRIX_ROUTING_ALGORITHM=vtc-basic/vtc-pred)
+      AIBRIX_ROUTER_VTC_TOKEN_TRACKER_MIN_TOKENS: ${AIBRIX_ROUTER_VTC_TOKEN_TRACKER_MIN_TOKENS:-}
+      AIBRIX_ROUTER_VTC_TOKEN_TRACKER_MAX_TOKENS: ${AIBRIX_ROUTER_VTC_TOKEN_TRACKER_MAX_TOKENS:-}
       # Prefix cache settings
       AIBRIX_PREFIX_CACHE_TOKENIZER_TYPE: tiktoken
       AIBRIX_PREFIX_CACHE_BLOCK_SIZE: "128"

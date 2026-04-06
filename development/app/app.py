@@ -9,6 +9,7 @@ import logging
 import struct
 import sys
 import time
+import threading
 from datetime import datetime
 from random import randint
 import os
@@ -24,6 +25,124 @@ NAMESPACE = os.getenv("POD_NAMESPACE", "default")
 DEFAULT_REPLICAS = int(os.getenv("DEFAULT_REPLICAS", "1"))
 SIMULATION = os.getenv("SIMULATION", "disabled")
 STANDALONE_MODE = os.getenv("STANDALONE_MODE", "false").lower() in ("true", "1", "yes")
+PORT = int(os.getenv("PORT", "8000"))
+
+# CPU-only / standalone mock latency model (可选启用)
+# 目的：在不跑真实 vLLM 的情况下，让请求耗时随 token 长度变化，从而放大不同路由算法在“长尾 + 用户偏斜”下的差异。
+_MOCK_ENABLE_LATENCY_MODEL = os.getenv("AIBRIX_MOCK_ENABLE_LATENCY_MODEL", "0").lower() in ("true", "1", "yes")
+_MOCK_BASE_LATENCY_MS = float(os.getenv("AIBRIX_MOCK_BASE_LATENCY_MS", "0"))
+
+# Optional: a coarse profile knob to make heterogeneity reproducible.
+# If explicit per-field envs are set, they always win.
+_MOCK_PROFILE = (os.getenv("AIBRIX_MOCK_PROFILE", "") or "").strip().lower()
+
+_raw_prefill_tps = os.getenv("AIBRIX_MOCK_PREFILL_TPS")
+_raw_decode_tps = os.getenv("AIBRIX_MOCK_DECODE_TPS")
+_raw_max_concurrency = os.getenv("AIBRIX_MOCK_MAX_CONCURRENCY")
+
+def _load_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+def _load_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return int(default)
+
+
+# Profile defaults (best-effort).
+# - normal: representative engine
+# - slow:   lower TPS and smaller concurrency to emulate slow GPU / congestion
+_profile_defaults = {
+    "normal": {"prefill_tps": 1500.0, "decode_tps": 300.0, "max_concurrency": 8},
+    "fast": {"prefill_tps": 2500.0, "decode_tps": 600.0, "max_concurrency": 12},
+    "slow": {"prefill_tps": 600.0, "decode_tps": 120.0, "max_concurrency": 4},
+}
+
+_p = _profile_defaults.get(_MOCK_PROFILE) if _MOCK_PROFILE else None
+
+_MOCK_PREFILL_TPS = _load_float_env(
+    "AIBRIX_MOCK_PREFILL_TPS",
+    (_p["prefill_tps"] if (_p and _raw_prefill_tps is None) else 0.0),
+)  # tokens / sec, 0 表示不计入
+_MOCK_DECODE_TPS = _load_float_env(
+    "AIBRIX_MOCK_DECODE_TPS",
+    (_p["decode_tps"] if (_p and _raw_decode_tps is None) else 0.0),
+)    # tokens / sec, 0 表示不计入
+_MOCK_STREAM_MIN_CHUNK_DELAY_MS = _load_float_env("AIBRIX_MOCK_STREAM_MIN_CHUNK_DELAY_MS", 0.0)
+
+# Optional: limit per-backend concurrency to simulate queuing/HoL blocking.
+_MOCK_MAX_CONCURRENCY = _load_int_env(
+    "AIBRIX_MOCK_MAX_CONCURRENCY",
+    (_p["max_concurrency"] if (_p and _raw_max_concurrency is None) else 0),
+)
+_MOCK_QUEUE_TIMEOUT_MS = _load_float_env("AIBRIX_MOCK_QUEUE_TIMEOUT_MS", 0.0)
+
+# If enabled, make /metrics default throughput fields reflect TPS config.
+_MOCK_METRICS_USE_TPS = os.getenv("AIBRIX_MOCK_METRICS_USE_TPS", "1").lower() in ("true", "1", "yes")
+
+_mock_semaphore = threading.BoundedSemaphore(_MOCK_MAX_CONCURRENCY) if _MOCK_MAX_CONCURRENCY > 0 else None
+_mock_lock = threading.Lock()
+_mock_inflight = 0
+_mock_waiting = 0
+
+
+def _mock_update_inflight(waiting_delta: int = 0, inflight_delta: int = 0):
+    """Best-effort: reflect live concurrency into /metrics for VTC utilization."""
+    global _mock_inflight, _mock_waiting, overrides
+    with _mock_lock:
+        _mock_waiting = max(0, _mock_waiting + waiting_delta)
+        _mock_inflight = max(0, _mock_inflight + inflight_delta)
+        overrides["waiting"] = _mock_waiting
+        overrides["running"] = _mock_inflight
+
+
+def _mock_acquire_slot() -> tuple[float, callable]:
+    """Acquire a backend slot; returns (queue_wait_seconds, release_fn)."""
+    if _mock_semaphore is None:
+        return 0.0, (lambda: None)
+
+    _mock_update_inflight(waiting_delta=1)
+    start = time.time()
+
+    timeout_s = max(_MOCK_QUEUE_TIMEOUT_MS, 0.0) / 1000.0
+    if timeout_s > 0:
+        acquired = _mock_semaphore.acquire(timeout=timeout_s)
+        if not acquired:
+            _mock_update_inflight(waiting_delta=-1)
+            raise TimeoutError("mock backend queue timeout")
+    else:
+        _mock_semaphore.acquire()
+
+    queue_wait = time.time() - start
+    _mock_update_inflight(waiting_delta=-1, inflight_delta=1)
+
+    def _release():
+        try:
+            _mock_semaphore.release()
+        finally:
+            _mock_update_inflight(inflight_delta=-1)
+
+    return queue_wait, _release
+
+
+def _mock_latency_seconds(input_tokens: int, output_tokens: int) -> float:
+    """返回 mock 端到端 latency（秒）。
+
+    - prefill 部分：input_tokens / PREFILL_TPS
+    - decode 部分：output_tokens / DECODE_TPS
+    - base：固定开销
+    """
+    if not _MOCK_ENABLE_LATENCY_MODEL:
+        return 0.0
+
+    base = max(_MOCK_BASE_LATENCY_MS, 0.0) / 1000.0
+    prefill = (float(input_tokens) / _MOCK_PREFILL_TPS) if _MOCK_PREFILL_TPS > 0 else 0.0
+    decode = (float(output_tokens) / _MOCK_DECODE_TPS) if _MOCK_DECODE_TPS > 0 else 0.0
+    return base + prefill + decode
 
 # Optional kubernetes import (only needed in Kubernetes environment)
 if not STANDALONE_MODE:
@@ -62,6 +181,30 @@ if SIMULATION != "disabled":
 
 tokenizer = None
 simulator = None  # Optional[Simulator] when simulation is enabled
+
+# When running in standalone CPU-only mode, we still want token counts to be
+# reasonably close to LLM tokenizers so that mock latency reflects prompt length.
+# Prefer `tiktoken` if available; fallback to a simple heuristic.
+_TIKTOKEN_ENCODING_NAME = os.getenv("AIBRIX_TIKTOKEN_ENCODING", "cl100k_base")
+_tiktoken_encoding = None  # cached encoding or False when unavailable
+
+
+def _get_tiktoken_encoding():
+    global _tiktoken_encoding
+    if _tiktoken_encoding is not None:
+        return _tiktoken_encoding
+    try:
+        import tiktoken  # type: ignore
+
+        try:
+            _tiktoken_encoding = tiktoken.get_encoding(_TIKTOKEN_ENCODING_NAME)
+        except Exception:
+            # Best-effort fallback
+            _tiktoken_encoding = tiktoken.get_encoding("cl100k_base")
+        return _tiktoken_encoding
+    except Exception:
+        _tiktoken_encoding = False
+        return _tiktoken_encoding
 
 # Extract the api_key argument and prepare for authentication
 api_key = None
@@ -179,11 +322,25 @@ HUGGINGFACE_TOKEN = configs.get("huggingface_token", "your huggingface token")
 
 def get_token_count(text):
     try:
-        # Encode the text
-        encoded_input = tokenizer(text)
+        # 优先使用 tokenizer（当 SIMULATION != disabled 且成功加载时）
+        if tokenizer is not None:
+            encoded_input = tokenizer(text)
+            return len(encoded_input["input_ids"])
 
-        # Get the number of tokens
-        return len(encoded_input["input_ids"])
+        # CPU-only fallback: try tiktoken first for better cross-lingual accuracy.
+        enc = _get_tiktoken_encoding()
+        if enc:
+            if text is None:
+                return 1
+            return max(1, len(enc.encode(str(text))))
+
+        # Final fallback: simple heuristic close to many BPE tokenizers.
+        if text is None:
+            return 1
+        s = str(text)
+        if not s.strip():
+            return 1
+        return max(1, (len(s) + 3) // 4)
     except Exception as e:
         logger.error(f"Failed to get number of tokens: {e}")
 
@@ -389,6 +546,15 @@ def completion():
             )
 
         arrived_at = datetime.now().timestamp()
+        try:
+            _, release_slot = _mock_acquire_slot()
+        except TimeoutError:
+            return create_error_response(
+                "The server is too busy. Please retry later.",
+                error_type="rate_limit_error",
+                status_code=503,
+            )
+
         input_tokens = get_token_count(prompt)
         output_tokens = max_tokens if max_tokens else randint(10, 500)
         arrived_next = request.json.get("next_in")
@@ -398,7 +564,7 @@ def completion():
             arrived_next += arrived_at
 
         start = datetime.now().timestamp()
-        latency = 0.0
+        latency = _mock_latency_seconds(input_tokens, output_tokens)
         if simulator is not None:
             latency = simulator.execute(
                 VidurRequest(
@@ -415,16 +581,41 @@ def completion():
         if stream:
 
             def generate():
-                completion_id = "cmpl-" + "".join(
-                    random.choices(
-                        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                        k=20,
+                try:
+                    completion_id = "cmpl-" + "".join(
+                        random.choices(
+                            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+                            k=20,
+                        )
                     )
-                )
-                full_text = f"This is simulated message from {model}!"
-                words = full_text.split()
-                for i, word in enumerate(words):
-                    chunk = {
+                    full_text = f"This is simulated message from {model}!"
+                    words = full_text.split()
+                    for i, word in enumerate(words):
+                        chunk = {
+                            "id": completion_id,
+                            "object": "text_completion",
+                            "created": int(arrived_at),
+                            "model": model,
+                            "system_fingerprint": "fp_44709d6fcb",
+                            "choices": [
+                                {
+                                    "text": word + (" " if i < len(words) - 1 else ""),
+                                    "index": 0,
+                                    "logprobs": None,
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        # 将 decode 时间摊到 streaming chunk 上（在输出 token 越多时流越慢）
+                        min_delay = max(_MOCK_STREAM_MIN_CHUNK_DELAY_MS, 0.0) / 1000.0
+                        if _MOCK_ENABLE_LATENCY_MODEL and _MOCK_DECODE_TPS > 0 and output_tokens and len(words) > 0:
+                            per_chunk = max((float(output_tokens) / _MOCK_DECODE_TPS) / float(len(words)), min_delay)
+                            time.sleep(per_chunk)
+                        else:
+                            time.sleep(max(0.05, min_delay))
+
+                    final_chunk = {
                         "id": completion_id,
                         "object": "text_completion",
                         "created": int(arrived_at),
@@ -432,39 +623,23 @@ def completion():
                         "system_fingerprint": "fp_44709d6fcb",
                         "choices": [
                             {
-                                "text": word + (" " if i < len(words) - 1 else ""),
+                                "text": "",
                                 "index": 0,
                                 "logprobs": None,
-                                "finish_reason": None,
+                                "finish_reason": "length",
                             }
                         ],
+                        "usage": {
+                            "prompt_tokens": input_tokens,
+                            "completion_tokens": output_tokens,
+                            "total_tokens": input_tokens + output_tokens,
+                        },
                     }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                    time.sleep(0.05)
-
-                final_chunk = {
-                    "id": completion_id,
-                    "object": "text_completion",
-                    "created": int(arrived_at),
-                    "model": model,
-                    "system_fingerprint": "fp_44709d6fcb",
-                    "choices": [
-                        {
-                            "text": "",
-                            "index": 0,
-                            "logprobs": None,
-                            "finish_reason": "length",
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": input_tokens,
-                        "completion_tokens": output_tokens,
-                        "total_tokens": input_tokens + output_tokens,
-                    },
-                }
-                yield f"data: {json.dumps(final_chunk)}\n\n"
-                time.sleep(0.01)  # Small delay to ensure data is flushed
-                yield "data: [DONE]\n\n"
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                    time.sleep(0.01)  # Small delay to ensure data is flushed
+                    yield "data: [DONE]\n\n"
+                finally:
+                    release_slot()
 
             response = Response(generate(), mimetype="text/event-stream")
             response.headers['Cache-Control'] = 'no-cache'
@@ -491,7 +666,10 @@ def completion():
                     "total_tokens": input_tokens + output_tokens,
                 },
             }
-            return jsonify(response), 200
+            try:
+                return jsonify(response), 200
+            finally:
+                release_slot()
     except Exception as e:
         err = {
             "error": {
@@ -530,6 +708,15 @@ def chat_completions():
             )
 
         arrived_at = datetime.now().timestamp()
+        try:
+            _, release_slot = _mock_acquire_slot()
+        except TimeoutError:
+            return create_error_response(
+                "The server is too busy. Please retry later.",
+                error_type="rate_limit_error",
+                status_code=503,
+            )
+
         input_tokens = sum(get_token_count(message["content"]) for message in messages)
         output_tokens = max_tokens if max_tokens else randint(10, 500)
         arrived_next = request.json.get("next_in")
@@ -539,7 +726,8 @@ def chat_completions():
             arrived_next += arrived_at
 
         start = datetime.now().timestamp()
-        latency = 0.0
+        # 对 streaming：我们希望 TTFT 主要由 prefill 决定；decode 时间在后续 chunk 中体现。
+        latency = _mock_latency_seconds(input_tokens, output_tokens)
         if simulator is not None:
             latency = simulator.execute(
                 VidurRequest(
@@ -548,44 +736,29 @@ def chat_completions():
             )
 
         overhead = datetime.now().timestamp() - start
-        if latency > overhead:
-            time.sleep(latency - overhead)
-        else:
-            logger.warning(f"Latency is less than overhead: L{latency} - O{overhead}")
+        # 只把 prefill/base 部分放在返回 stream 之前，避免 TTFT 固定为 0
+        prefill_only = 0.0
+        if _MOCK_ENABLE_LATENCY_MODEL:
+            base = max(_MOCK_BASE_LATENCY_MS, 0.0) / 1000.0
+            prefill_only = base + ((float(input_tokens) / _MOCK_PREFILL_TPS) if _MOCK_PREFILL_TPS > 0 else 0.0)
+        if prefill_only > overhead:
+            time.sleep(prefill_only - overhead)
+        elif latency > 0.0 and prefill_only > 0.0:
+            logger.warning(f"Latency is less than overhead: L{prefill_only} - O{overhead}")
 
         if stream:
 
             def generate():
-                completion_id = "chatcmpl-" + "".join(
-                    random.choices(
-                        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                        k=20,
+                try:
+                    completion_id = "chatcmpl-" + "".join(
+                        random.choices(
+                            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+                            k=20,
+                        )
                     )
-                )
 
-                # First chunk with role
-                role_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(arrived_at),
-                    "model": model,
-                    "system_fingerprint": "fp_44709d6fcb",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant"},
-                            "logprobs": None,
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(role_chunk)}\n\n"
-
-                # Content chunks
-                full_text = f"\n\nThis is simulated message from {model}!"
-                words = full_text.split()
-                for i, word in enumerate(words):
-                    chunk = {
+                    # First chunk with role
+                    role_chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": int(arrived_at),
@@ -594,56 +767,85 @@ def chat_completions():
                         "choices": [
                             {
                                 "index": 0,
-                                "delta": {
-                                    "content": word
-                                    + (" " if i < len(words) - 1 else "")
-                                },
+                                "delta": {"role": "assistant"},
                                 "logprobs": None,
                                 "finish_reason": None,
                             }
                         ],
                     }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                    time.sleep(0.05)
+                    yield f"data: {json.dumps(role_chunk)}\n\n"
 
-                # Final chunk with finish_reason
-                final_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(arrived_at),
-                    "model": model,
-                    "system_fingerprint": "fp_44709d6fcb",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "logprobs": None,
-                            "finish_reason": "stop",
+                    # Content chunks
+                    full_text = f"\n\nThis is simulated message from {model}!"
+                    words = full_text.split()
+                    for i, word in enumerate(words):
+                        chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(arrived_at),
+                            "model": model,
+                            "system_fingerprint": "fp_44709d6fcb",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "content": word
+                                        + (" " if i < len(words) - 1 else "")
+                                    },
+                                    "logprobs": None,
+                                    "finish_reason": None,
+                                }
+                            ],
                         }
-                    ],
-                }
-                yield f"data: {json.dumps(final_chunk)}\n\n"
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        # 将 decode 时间摊到 streaming chunk 上（在输出 token 越多时流越慢）
+                        min_delay = max(_MOCK_STREAM_MIN_CHUNK_DELAY_MS, 0.0) / 1000.0
+                        if _MOCK_ENABLE_LATENCY_MODEL and _MOCK_DECODE_TPS > 0 and output_tokens and len(words) > 0:
+                            per_chunk = max((float(output_tokens) / _MOCK_DECODE_TPS) / float(len(words)), min_delay)
+                            time.sleep(per_chunk)
+                        else:
+                            time.sleep(max(0.05, min_delay))
 
-                # Usage chunk (optional, included when stream_options.include_usage is true)
-                if include_usage:
-                    usage_chunk = {
+                    # Final chunk with finish_reason
+                    final_chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": int(arrived_at),
                         "model": model,
                         "system_fingerprint": "fp_44709d6fcb",
-                        "choices": [],
-                        "usage": {
-                            "prompt_tokens": input_tokens,
-                            "completion_tokens": output_tokens,
-                            "total_tokens": input_tokens + output_tokens,
-                        },
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "logprobs": None,
+                                "finish_reason": "stop",
+                            }
+                        ],
                     }
-                    yield f"data: {json.dumps(usage_chunk)}\n\n"
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
 
-                # Stream termination
-                time.sleep(0.01)  # Small delay to ensure data is flushed
-                yield "data: [DONE]\n\n"
+                    # Usage chunk (optional, included when stream_options.include_usage is true)
+                    if include_usage:
+                        usage_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(arrived_at),
+                            "model": model,
+                            "system_fingerprint": "fp_44709d6fcb",
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": input_tokens,
+                                "completion_tokens": output_tokens,
+                                "total_tokens": input_tokens + output_tokens,
+                            },
+                        }
+                        yield f"data: {json.dumps(usage_chunk)}\n\n"
+
+                    # Stream termination
+                    time.sleep(0.01)  # Small delay to ensure data is flushed
+                    yield "data: [DONE]\n\n"
+                finally:
+                    release_slot()
 
             response = Response(generate(), mimetype="text/event-stream")
             response.headers['Cache-Control'] = 'no-cache'
@@ -672,7 +874,10 @@ def chat_completions():
                     }
                 ],
             }
-            return jsonify(response), 200
+            try:
+                return jsonify(response), 200
+            finally:
+                release_slot()
     except Exception as e:
         err = {
             "error": {
@@ -1578,23 +1783,24 @@ def metrics():
     model_name = overrides.get("model_name", MODEL_NAME)
     # calculate metrics with potential overrides
     success_total = overrides.get("success_total", total / replicas)
-    avg_prompt_throughput = overrides.get(
-        "avg_prompt_throughput", total / replicas if replicas > 0 else 0
-    )
-    avg_generation_throughput = overrides.get(
-        "avg_generation_throughput", total / replicas if replicas > 0 else 0
-    )
+    # Make throughput metrics more realistic in standalone mock mode.
+    # When latency model is enabled, default to configured TPS; otherwise keep legacy heuristic.
+    _default_prompt_tps = (float(_MOCK_PREFILL_TPS) if (_MOCK_METRICS_USE_TPS and _MOCK_ENABLE_LATENCY_MODEL and _MOCK_PREFILL_TPS > 0) else (total / replicas if replicas > 0 else 0))
+    _default_decode_tps = (float(_MOCK_DECODE_TPS) if (_MOCK_METRICS_USE_TPS and _MOCK_ENABLE_LATENCY_MODEL and _MOCK_DECODE_TPS > 0) else (total / replicas if replicas > 0 else 0))
+    avg_prompt_throughput = overrides.get("avg_prompt_throughput", _default_prompt_tps)
+    avg_generation_throughput = overrides.get("avg_generation_throughput", _default_decode_tps)
     prompt_tokens_total = overrides.get(
         "prompt_tokens_total", randint(100, 1024) * success_total
     )
     generation_tokens_total = overrides.get(
         "generation_tokens_total", randint(100, 1024) * success_total
     )
-    running = overrides.get("running", randint(1, 100))
+    running = overrides.get("running", 0)
     cpu_running = overrides.get("cpu_running", randint(1, 100))
-    waiting = overrides.get("waiting", randint(1, 100))
+    waiting = overrides.get("waiting", 0)
     swapped = overrides.get("swapped", randint(1, 100))
-    max_running_capacity = 100
+    # Best-effort: align "capacity" with the mock concurrency limiter if enabled.
+    max_running_capacity = _MOCK_MAX_CONCURRENCY if _MOCK_MAX_CONCURRENCY > 0 else 100
     gpu_cache_usage_perc = overrides.get(
         "gpu_cache_usage_perc", min(100.0, (running / max_running_capacity) * 100)
     )
@@ -1855,7 +2061,7 @@ if __name__ == "__main__":
     )  # Suppress kubenetes logs
 
     print(
-        f"Starting app. DEPLOYMENT_NAME: {DEPLOYMENT_NAME}, NAMESPACE: {NAMESPACE}, MODEL: {MODEL_NAME}"
+        f"Starting app. DEPLOYMENT_NAME: {DEPLOYMENT_NAME}, NAMESPACE: {NAMESPACE}, MODEL: {MODEL_NAME}, PORT: {PORT}"
     )
 
     # Extract gpu_device without call argparse
@@ -1915,7 +2121,7 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"Failed to load k8s config: {e}")
 
-        app.run(host="0.0.0.0", port=8000)
+        app.run(host="0.0.0.0", port=PORT)
 
     if simulator is not None:
         simulator.stop()

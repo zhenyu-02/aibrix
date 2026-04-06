@@ -19,6 +19,8 @@ package cache
 import (
 	"math"
 	"math/rand"
+	"os"
+	"strings"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -30,8 +32,44 @@ import (
 const (
 	MovingInterval        = 10 * time.Second
 	MaxOutputLen          = 4096 // TODO: override this value if profile is provided.
-	DefaultColdPrediction = OptimisticColdPrediction
 )
+
+const (
+	// EnvOutputPredictorColdStrategy controls the cold-start strategy of output predictor.
+	//
+	// Accepted values (case-insensitive):
+	// - "optimistic"  : return 1
+	// - "input"       : return inputTokens
+	// - "random"      : random in [1, MaxOutputLen]
+	// - "pessimistic" : return MaxOutputLen
+	//
+	// Default: optimistic (backward compatible).
+	EnvOutputPredictorColdStrategy = "AIBRIX_OUTPUT_PREDICTOR_COLD_STRATEGY"
+)
+
+// DefaultColdPrediction defines the strategy when there is no history for the predictor.
+// It is configurable via EnvOutputPredictorColdStrategy.
+var DefaultColdPrediction = loadColdPredictionStrategy()
+
+func loadColdPredictionStrategy() ColdPredictionStrategy {
+	v := strings.TrimSpace(os.Getenv(EnvOutputPredictorColdStrategy))
+	if v == "" {
+		return OptimisticColdPrediction
+	}
+	switch strings.ToLower(v) {
+	case "optimistic", "min", "1":
+		return OptimisticColdPrediction
+	case "random":
+		return RandomColdPredition
+	case "input":
+		return InputColdPrediction
+	case "pessimistic", "max":
+		return PessimiticColdPrediction
+	default:
+		klog.Warningf("unknown %s=%q, fallback to optimistic", EnvOutputPredictorColdStrategy, v)
+		return OptimisticColdPrediction
+	}
+}
 
 const (
 	// OptimisticColdPrediction predicts the output to be minimum 1 to be profile friendly. (most profiles should best result if output length is minimum)

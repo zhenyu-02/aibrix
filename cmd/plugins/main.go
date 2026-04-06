@@ -132,18 +132,27 @@ func main() {
 	}
 	klog.Infof("Started metrics server on %s", metricsAddr)
 
-	s := grpc.NewServer()
+	// Allow large ext_proc messages (sessioned workloads may have big request bodies).
+	// grpc-go defaults are small (4MB) and can cause Envoy to return 500 when body is large.
+	s := grpc.NewServer(
+		grpc.MaxRecvMsgSize(64<<20),
+		grpc.MaxSendMsgSize(64<<20),
+	)
 	extProcPb.RegisterExternalProcessorServer(s, gatewayServer)
 
 	healthCheck := health.NewServer()
 	healthPb.RegisterHealthServer(s, healthCheck)
+	// Envoy gRPC health check defaults to empty service name.
+	// Mark both the empty service and a named service as SERVING.
+	healthCheck.SetServingStatus("", healthPb.HealthCheckResponse_SERVING)
 	healthCheck.SetServingStatus("gateway-plugin", healthPb.HealthCheckResponse_SERVING)
 
 	klog.Info("starting gRPC server on " + grpcAddr)
 
 	go func() {
+		// Profiling is best-effort. In local dev it is common that 6060 is already used.
 		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
-			klog.Fatalf("failed to setup profiling: %v", err)
+			klog.Warningf("failed to setup profiling: %v", err)
 		}
 	}()
 

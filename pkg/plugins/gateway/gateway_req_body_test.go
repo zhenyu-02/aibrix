@@ -19,6 +19,7 @@ package gateway
 import (
 	"context"
 	"testing"
+	"strconv"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -36,6 +37,53 @@ import (
 	"github.com/vllm-project/aibrix/pkg/types"
 	"github.com/vllm-project/aibrix/pkg/utils"
 )
+
+func findHeader(headers []*configPb.HeaderValueOption, key string) (*configPb.HeaderValueOption, bool) {
+	for _, h := range headers {
+		if h != nil && h.Header != nil && h.Header.Key == key {
+			return h, true
+		}
+	}
+	return nil, false
+}
+
+func headerValueString(h *configPb.HeaderValueOption) string {
+	if h == nil || h.Header == nil {
+		return ""
+	}
+	if len(h.Header.RawValue) > 0 {
+		return string(h.Header.RawValue)
+	}
+	return h.Header.Value
+}
+
+func assertHeaderValue(t *testing.T, headers []*configPb.HeaderValueOption, key, want string) {
+	h, ok := findHeader(headers, key)
+	if !assert.True(t, ok, "header %s not found", key) {
+		return
+	}
+	assert.Equal(t, want, headerValueString(h), "header %s value mismatch", key)
+}
+
+func assertHeaderNotPresent(t *testing.T, headers []*configPb.HeaderValueOption, key string) {
+	_, ok := findHeader(headers, key)
+	assert.False(t, ok, "header %s should not be present", key)
+}
+
+func assertHeadersContainAll(t *testing.T, got []*configPb.HeaderValueOption, expected []*configPb.HeaderValueOption) {
+	for _, e := range expected {
+		if e == nil || e.Header == nil {
+			continue
+		}
+		want := ""
+		if len(e.Header.RawValue) > 0 {
+			want = string(e.Header.RawValue)
+		} else {
+			want = e.Header.Value
+		}
+		assertHeaderValue(t, got, e.Header.Key, want)
+	}
+}
 
 // TestRouterAlgorithm is a dedicated routing algorithm for testing
 const TestRouterAlgorithm types.RoutingAlgorithm = "test-router"
@@ -109,7 +157,8 @@ func Test_handleRequestBody(t *testing.T) {
 			validate: func(t *testing.T, tt *testCase, resp *extProcPb.ProcessingResponse, model string, routingCtx *types.RoutingContext, stream bool, term int64) {
 				// Validate that only the model header is set and no routing headers are present
 				assert.Equal(t, tt.expected.statusCode, envoyTypePb.StatusCode_OK)
-				assert.Equal(t, tt.expected.headers, resp.GetRequestBody().GetResponse().GetHeaderMutation().GetSetHeaders())
+				setHeaders := resp.GetRequestBody().GetResponse().GetHeaderMutation().GetSetHeaders()
+				assertHeaderValue(t, setHeaders, HeaderModel, tt.expected.model)
 				assert.Equal(t, tt.expected.model, model)
 				assert.Equal(t, tt.expected.stream, stream)
 				assert.Equal(t, tt.expected.term, term)
@@ -117,10 +166,8 @@ func Test_handleRequestBody(t *testing.T) {
 				assert.Equal(t, tt.expected.model, routingCtx.Model)
 				assert.Equal(t, tt.routingAlgo, routingCtx.Algorithm)
 				// Verify no routing headers are set
-				for _, header := range resp.GetRequestBody().GetResponse().GetHeaderMutation().GetSetHeaders() {
-					assert.NotEqual(t, HeaderRoutingStrategy, header.Header.Key)
-					assert.NotEqual(t, HeaderTargetPod, header.Header.Key)
-				}
+				assertHeaderNotPresent(t, setHeaders, HeaderRoutingStrategy)
+				assertHeaderNotPresent(t, setHeaders, HeaderTargetPod)
 			},
 		},
 		{
@@ -156,7 +203,8 @@ func Test_handleRequestBody(t *testing.T) {
 			},
 			validate: func(t *testing.T, tt *testCase, resp *extProcPb.ProcessingResponse, model string, routingCtx *types.RoutingContext, stream bool, term int64) {
 				assert.Equal(t, tt.expected.statusCode, resp.GetImmediateResponse().GetStatus().GetCode())
-				assert.Equal(t, tt.expected.headers, resp.GetImmediateResponse().GetHeaders().GetSetHeaders())
+				setHeaders := resp.GetImmediateResponse().GetHeaders().GetSetHeaders()
+				assertHeadersContainAll(t, setHeaders, tt.expected.headers)
 				assert.Equal(t, tt.expected.model, model)
 				assert.Equal(t, tt.expected.stream, stream)
 				assert.Equal(t, tt.expected.term, term)
@@ -243,7 +291,12 @@ func Test_handleRequestBody(t *testing.T) {
 			},
 			validate: func(t *testing.T, tt *testCase, resp *extProcPb.ProcessingResponse, model string, routingCtx *types.RoutingContext, stream bool, term int64) {
 				assert.Equal(t, tt.expected.statusCode, envoyTypePb.StatusCode_OK)
-				assert.Equal(t, tt.expected.headers, resp.GetRequestBody().GetResponse().GetHeaderMutation().GetSetHeaders())
+				setHeaders := resp.GetRequestBody().GetResponse().GetHeaderMutation().GetSetHeaders()
+				assertHeaderValue(t, setHeaders, HeaderTargetCluster, "")
+				assertHeaderValue(t, setHeaders, HeaderRoutingStrategy, "test-router")
+				assertHeaderValue(t, setHeaders, HeaderTargetPod, "1.2.3.4:8000")
+				assertHeaderValue(t, setHeaders, "content-length", strconv.Itoa(len(tt.requestBody)))
+				assertHeaderValue(t, setHeaders, "X-Request-Id", "test-request-id")
 				assert.Equal(t, tt.expected.model, model)
 				assert.Equal(t, tt.expected.stream, stream)
 				assert.Equal(t, tt.expected.term, term)
@@ -405,7 +458,8 @@ func Test_handleRequestBody(t *testing.T) {
 			},
 			validate: func(t *testing.T, tt *testCase, resp *extProcPb.ProcessingResponse, model string, routingCtx *types.RoutingContext, stream bool, term int64) {
 				assert.Equal(t, tt.expected.statusCode, resp.GetImmediateResponse().GetStatus().GetCode())
-				assert.Equal(t, tt.expected.headers, resp.GetImmediateResponse().GetHeaders().GetSetHeaders())
+				setHeaders := resp.GetImmediateResponse().GetHeaders().GetSetHeaders()
+				assertHeadersContainAll(t, setHeaders, tt.expected.headers)
 				assert.Equal(t, tt.expected.model, model)
 				assert.Equal(t, tt.expected.stream, stream)
 				assert.Equal(t, tt.expected.term, term)
@@ -450,7 +504,8 @@ func Test_handleRequestBody(t *testing.T) {
 			},
 			validate: func(t *testing.T, tt *testCase, resp *extProcPb.ProcessingResponse, model string, routingCtx *types.RoutingContext, stream bool, term int64) {
 				assert.Equal(t, tt.expected.statusCode, resp.GetImmediateResponse().GetStatus().GetCode())
-				assert.Equal(t, tt.expected.headers, resp.GetImmediateResponse().GetHeaders().GetSetHeaders())
+				setHeaders := resp.GetImmediateResponse().GetHeaders().GetSetHeaders()
+				assertHeadersContainAll(t, setHeaders, tt.expected.headers)
 				assert.Equal(t, tt.expected.model, model)
 				assert.Equal(t, tt.expected.stream, stream)
 				assert.Equal(t, tt.expected.term, term)
@@ -510,7 +565,8 @@ func Test_handleRequestBody(t *testing.T) {
 			},
 			validate: func(t *testing.T, tt *testCase, resp *extProcPb.ProcessingResponse, model string, routingCtx *types.RoutingContext, stream bool, term int64) {
 				assert.Equal(t, tt.expected.statusCode, resp.GetImmediateResponse().GetStatus().GetCode())
-				assert.Equal(t, tt.expected.headers, resp.GetImmediateResponse().GetHeaders().GetSetHeaders())
+				setHeaders := resp.GetImmediateResponse().GetHeaders().GetSetHeaders()
+				assertHeadersContainAll(t, setHeaders, tt.expected.headers)
 				assert.Equal(t, tt.expected.model, model)
 				assert.Equal(t, tt.expected.stream, stream)
 				assert.Equal(t, tt.expected.term, term)
@@ -567,7 +623,8 @@ func Test_handleRequestBody(t *testing.T) {
 			},
 			validate: func(t *testing.T, tt *testCase, resp *extProcPb.ProcessingResponse, model string, routingCtx *types.RoutingContext, stream bool, term int64) {
 				assert.Equal(t, tt.expected.statusCode, resp.GetImmediateResponse().GetStatus().GetCode())
-				assert.Equal(t, tt.expected.headers, resp.GetImmediateResponse().GetHeaders().GetSetHeaders())
+				setHeaders := resp.GetImmediateResponse().GetHeaders().GetSetHeaders()
+				assertHeadersContainAll(t, setHeaders, tt.expected.headers)
 				assert.Equal(t, tt.expected.model, model)
 				assert.Equal(t, tt.expected.stream, stream)
 				assert.Equal(t, tt.expected.term, term)

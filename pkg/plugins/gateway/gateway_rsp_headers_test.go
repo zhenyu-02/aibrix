@@ -177,8 +177,13 @@ func Test_HandleResponseHeaders(t *testing.T) {
 
 			// Validate headers set in response
 			actualHeaders := resp.GetResponseHeaders().GetResponse().GetHeaderMutation().GetSetHeaders()
-			if !cmp.Equal(tt.expected.headers, actualHeaders, protocmp.Transform()) {
-				t.Fatalf("Headers do not match:\n%s", cmp.Diff(tt.expected.headers, actualHeaders, protocmp.Transform()))
+			cmpOpts := []cmp.Option{
+				protocmp.Transform(),
+				// ext_proc header mutation should be deterministic; append_action is an implementation detail.
+				protocmp.IgnoreFields(&configPb.HeaderValueOption{}, "append_action"),
+			}
+			if !cmp.Equal(tt.expected.headers, actualHeaders, cmpOpts...) {
+				t.Fatalf("Headers do not match:\n%s", cmp.Diff(tt.expected.headers, actualHeaders, cmpOpts...))
 			}
 		})
 	}

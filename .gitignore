@@ -64,3 +64,6 @@ samples/multimodality/xDiT/xDiT-integration/xDiT
 
 # setuptools-scm generated version files
 **/_version.py
+
+# len-pred-exp artifacts
+len-pred-exp

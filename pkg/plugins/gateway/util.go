@@ -403,6 +403,9 @@ func buildEnvoyProxyHeaders(headers []*configPb.HeaderValueOption, keyValues ...
 					Key:      keyValues[i],
 					RawValue: []byte(keyValues[i+1]),
 				},
+				// We almost always want deterministic behavior in ext_proc: if a header exists,
+				// overwrite it instead of appending another value.
+				AppendAction: configPb.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
 			},
 		)
 		i += 2

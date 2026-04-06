@@ -18,6 +18,8 @@ package gateway
 
 import (
 	"errors"
+	"os"
+	"strconv"
 	"sync"
 )
 
@@ -46,6 +48,7 @@ const (
 	// Request & Target Headers
 	HeaderWentIntoReqHeaders = "x-went-into-req-headers"
 	HeaderTargetPod          = "target-pod"
+	HeaderTargetCluster      = "target-cluster"
 	HeaderRoutingStrategy    = "routing-strategy"
 	HeaderRequestID          = "request-id"
 	HeaderModel              = "model"
@@ -65,6 +68,9 @@ const (
 
 	// Envs
 	EnvRoutingAlgorithm = "ROUTING_ALGORITHM"
+	// Disable user lookup / rate limit (for local benchmark / cpu-only simulation)
+	EnvDisableRedisUserStore = "AIBRIX_DISABLE_REDIS_USER_STORE"
+	EnvDisableRateLimit      = "AIBRIX_DISABLE_RATE_LIMIT"
 
 	// OpenAI Error Types
 	ErrorTypeInvalidRequest = "invalid_request_error"
@@ -107,3 +113,17 @@ var (
 	ErrorUnknownResponse = errors.New("unknown response")
 	requestBuffers       sync.Map // Thread-safe map to track buffers per request
 )
+
+// loadEnvBool parses a boolean env var in a quiet way (no logging).
+// Any parse failure returns false.
+func loadEnvBool(key string) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false
+	}
+	return b
+}

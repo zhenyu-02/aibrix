@@ -18,6 +18,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"k8s.io/klog/v2"
@@ -41,6 +42,7 @@ const (
 
 func (s *Server) HandleRequestHeaders(ctx context.Context, requestID string, req *extProcPb.ProcessingRequest) (*extProcPb.ProcessingResponse, utils.User, int64, *types.RoutingContext) {
 	var username, requestPath string
+	var modelHeader string
 	var user utils.User
 	var rpm int64
 	var err error
@@ -53,6 +55,8 @@ func (s *Server) HandleRequestHeaders(ctx context.Context, requestID string, req
 		switch strings.ToLower(n.Key) {
 		case userKey:
 			username = string(n.RawValue)
+		case HeaderModel:
+			modelHeader = string(n.RawValue)
 		case pathKey:
 			requestPath = string(n.RawValue)
 		case authorizationKey:
@@ -66,6 +70,7 @@ func (s *Server) HandleRequestHeaders(ctx context.Context, requestID string, req
 
 	routingStrategy, routingStrategyEnabled := getRoutingStrategy(h.RequestHeaders.Headers.Headers)
 	routingAlgorithm, ok := routing.Validate(routingStrategy)
+	klog.V(2).InfoS("request headers received", "requestID", requestID, "path", requestPath, "user", username, "modelHeader", modelHeader, "routingStrategy", routingStrategy, "routingEnabled", routingStrategyEnabled)
 	if routingStrategyEnabled && !ok {
 		klog.ErrorS(nil, "incorrect routing strategy", "requestID", requestID, "routing-strategy", routingStrategy)
 		return generateErrorResponse(
@@ -76,27 +81,36 @@ func (s *Server) HandleRequestHeaders(ctx context.Context, requestID string, req
 	}
 
 	if username != "" {
-		user, err = utils.GetUser(ctx, utils.User{Name: username}, s.redisClient)
-		if err != nil {
-			klog.ErrorS(err, "unable to process user info", "requestID", requestID, "username", username)
-			return generateErrorResponse(
-				envoyTypePb.StatusCode_InternalServerError,
-				[]*configPb.HeaderValueOption{{Header: &configPb.HeaderValue{
-					Key: HeaderErrorUser, RawValue: []byte("true"),
-				}}},
-				err.Error(), "", ""), utils.User{}, rpm, routingCtx
+		if loadEnvBool(EnvDisableRedisUserStore) {
+			user = utils.User{Name: username}
+		} else {
+			user, err = utils.GetUser(ctx, utils.User{Name: username}, s.redisClient)
+			if err != nil {
+				klog.ErrorS(err, "unable to process user info", "requestID", requestID, "username", username)
+				return generateErrorResponse(
+					envoyTypePb.StatusCode_InternalServerError,
+					[]*configPb.HeaderValueOption{{Header: &configPb.HeaderValue{
+						Key: HeaderErrorUser, RawValue: []byte("true"),
+					}}},
+					err.Error(), "", ""), utils.User{}, rpm, routingCtx
+			}
 		}
 
-		rpm, errRes, err = s.checkLimits(ctx, user)
-		if errRes != nil {
-			klog.ErrorS(err, "error on checking limits", "requestID", requestID, "username", username)
-			return errRes, utils.User{}, rpm, routingCtx
+		if !loadEnvBool(EnvDisableRateLimit) {
+			rpm, errRes, err = s.checkLimits(ctx, user)
+			if errRes != nil {
+				klog.ErrorS(err, "error on checking limits", "requestID", requestID, "username", username)
+				return errRes, utils.User{}, rpm, routingCtx
+			}
 		}
 	}
 
 	routingCtx = types.NewRoutingContext(ctx, routingAlgorithm, "", "", requestID, user.Name)
 	routingCtx.ReqPath = requestPath
 	routingCtx.ReqHeaders = reqHeaders
+	if modelHeader != "" {
+		routingCtx.Model = modelHeader
+	}
 
 	headers := []*configPb.HeaderValueOption{}
 	headers = append(headers, &configPb.HeaderValueOption{
@@ -105,6 +119,38 @@ func (s *Server) HandleRequestHeaders(ctx context.Context, requestID string, req
 			RawValue: []byte("true"),
 		},
 	})
+
+	// Local dev optimization: if client provides `model` in request headers, we can
+	// pre-select target pod and rewrite `:authority` early. This makes Envoy's
+	// dynamic forward proxy work even when the actual OpenAI request body is buffered.
+	if s.cache != nil && routingCtx.Model != "" && routingAlgorithm != routing.RouterNotSet {
+		if !s.cache.HasModel(routingCtx.Model) {
+			return generateErrorResponse(envoyTypePb.StatusCode_BadRequest,
+				[]*configPb.HeaderValueOption{{Header: &configPb.HeaderValue{Key: HeaderErrorNoModelBackends, RawValue: []byte(routingCtx.Model)}}},
+				fmt.Sprintf("model %s does not exist", routingCtx.Model), ErrorCodeModelNotFound, "model"), utils.User{}, rpm, routingCtx
+		}
+		podsArr, err := s.cache.ListPodsByModel(routingCtx.Model)
+		if err == nil && podsArr != nil && utils.CountRoutablePods(podsArr.All()) > 0 {
+			externalFilter := routingCtx.ReqHeaders[HeaderExternalFilter]
+			targetPodIP, selErr := s.selectTargetPod(routingCtx, podsArr, externalFilter)
+			if targetPodIP != "" && selErr == nil {
+				klog.V(2).InfoS("preselected target pod from headers", "requestID", requestID, "model", routingCtx.Model, "targetPod", targetPodIP)
+				clusterName := ""
+				if routingCtx.HasRouted() {
+					if p := routingCtx.TargetPod(); p != nil {
+						clusterName = p.Labels["aibrix.ai/standalone-cluster"]
+					}
+				}
+				headers = buildEnvoyProxyHeaders(headers,
+					HeaderTargetCluster, clusterName,
+					HeaderRoutingStrategy, string(routingAlgorithm),
+					HeaderTargetPod, targetPodIP,
+					"X-Request-Id", routingCtx.RequestID,
+					HeaderModel, routingCtx.Model,
+				)
+			}
+		}
+	}
 
 	// Note: Path rewriting for /v1/images/generations and /v1/video/generations
 	// is handled in HandleRequestBody based on the engine type (model.aibrix.ai/engine label).

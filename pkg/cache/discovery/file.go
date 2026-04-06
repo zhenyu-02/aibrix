@@ -119,6 +119,10 @@ func endpointToPod(modelName string, index int, ep EndpointConfig) (*v1.Pod, err
 		constants.ModelLabelName: modelName,
 		constants.ModelLabelPort: portStr,
 	}
+	// Standalone-only: expose an Envoy cluster name so the gateway-plugin can route
+	// via `cluster_header` without relying on rewriting `:authority`.
+	// NOTE: This is only used in standalone/file-discovery setups.
+	labels["aibrix.ai/standalone-cluster"] = fmt.Sprintf("standalone_backend_%d", index)
 	// Copy custom labels (e.g., role-name, roleset-name for P/D routing)
 	for k, v := range ep.Labels {
 		labels[k] = v

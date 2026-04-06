@@ -18,6 +18,7 @@ package gateway
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	configPb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -27,11 +28,34 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	routingalgorithms "github.com/vllm-project/aibrix/pkg/plugins/gateway/algorithms"
+	"github.com/vllm-project/aibrix/pkg/plugins/gateway/ratelimiter"
 	"github.com/vllm-project/aibrix/pkg/types"
 	"github.com/vllm-project/aibrix/pkg/utils"
 )
 
 var redisClient = redis.NewClient(&redis.Options{})
+
+type fakeRateLimiter struct {
+	mu sync.Mutex
+	m  map[string]int64
+}
+
+func (f *fakeRateLimiter) Get(_ context.Context, key string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.m[key], nil
+}
+
+func (f *fakeRateLimiter) GetLimit(_ context.Context, _ string) (int64, error) {
+	return 0, nil
+}
+
+func (f *fakeRateLimiter) Incr(_ context.Context, key string, val int64) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.m[key] += val
+	return f.m[key], nil
+}
 
 // Test_handleRequestHeaders tests the HandleRequestHeaders function for various scenarios
 func Test_handleRequestHeaders(t *testing.T) {
@@ -90,7 +114,7 @@ func Test_handleRequestHeaders(t *testing.T) {
 			},
 		},
 		{
-			name: "not found user in redis cache - should return error",
+			name: "not found user in redis cache - should fallback to default user",
 			requestHeaders: []*configPb.HeaderValue{
 				{
 					Key:      userKey,
@@ -102,26 +126,20 @@ func Test_handleRequestHeaders(t *testing.T) {
 				},
 			},
 			expected: testResponse{
-				statusCode: envoyTypePb.StatusCode_InternalServerError,
+				statusCode: envoyTypePb.StatusCode_OK,
 				headers: []*configPb.HeaderValueOption{
-					{Header: &configPb.HeaderValue{Key: HeaderErrorUser, RawValue: []byte("true")}},
-					{Header: &configPb.HeaderValue{Key: "Content-Type", Value: "application/json"}},
+					{Header: &configPb.HeaderValue{Key: HeaderWentIntoReqHeaders, RawValue: []byte("true")}},
 				},
-				routingCtx: nil,
-				user:       utils.User{},
-				rpm:        0,
+				routingCtx: &types.RoutingContext{},
+				user:       utils.User{Name: "test-user"},
+				rpm:        1,
 			},
 			validate: func(t *testing.T, tt *testCase, resp *extProcPb.ProcessingResponse, user utils.User, routingCtx *types.RoutingContext, rpm int64) {
-				// Validate request headers info
-				assert.Equal(t, tt.expected.statusCode, resp.GetImmediateResponse().GetStatus().GetCode())
-				assert.Equal(t, tt.expected.headers, resp.GetImmediateResponse().GetHeaders().GetSetHeaders())
+				assert.Equal(t, tt.expected.statusCode, envoyTypePb.StatusCode_OK)
+				assert.Equal(t, tt.expected.headers, resp.GetRequestHeaders().GetResponse().GetHeaderMutation().GetSetHeaders())
 				assert.Equal(t, tt.expected.user, user)
-				assert.Nil(t, routingCtx)
+				assert.NotNil(t, routingCtx)
 				assert.Equal(t, tt.expected.rpm, rpm)
-				// Verify no special headers are set
-				for _, header := range resp.GetRequestHeaders().GetResponse().GetHeaderMutation().GetSetHeaders() {
-					assert.NotEqual(t, HeaderWentIntoReqHeaders, header.Header.Key)
-				}
 			},
 		},
 		{
@@ -184,6 +202,7 @@ func Test_handleRequestHeaders(t *testing.T) {
 			// Create server with mock cache
 			server := &Server{
 				redisClient: redisClient,
+				ratelimiter: ratelimiter.RateLimiter(&fakeRateLimiter{m: map[string]int64{}}),
 			}
 
 			// Create request for the test case

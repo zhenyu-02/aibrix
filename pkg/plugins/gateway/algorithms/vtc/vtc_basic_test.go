@@ -37,14 +37,27 @@ var (
 	errNotImplemented = errors.New("not implemented")
 )
 
+type fixedOutputPredictor struct {
+	output int
+}
+
+func (p *fixedOutputPredictor) AddTrace(inputTokens, outputTokens int, cnt int32) {
+}
+
+func (p *fixedOutputPredictor) Predict(promptLen int) int {
+	return p.output
+}
+
 // SimpleCache is a simplified implementation of the cache interface for testing
 type SimpleCache struct {
-	metrics map[string]map[string]map[string]float64
+	metrics          map[string]map[string]map[string]float64
+	outputPredictors map[string]types.OutputPredictor
 }
 
 func NewSimpleCache() *SimpleCache {
 	return &SimpleCache{
-		metrics: make(map[string]map[string]map[string]float64),
+		metrics:          make(map[string]map[string]map[string]float64),
+		outputPredictors: make(map[string]types.OutputPredictor),
 	}
 }
 
@@ -77,6 +90,18 @@ func (c *SimpleCache) GetMetricValueByPod(podName, podNamespace, metricName stri
 }
 
 func (c *SimpleCache) AddSubscriber(subscriber metrics.MetricSubscriber) {
+}
+
+func (c *SimpleCache) GetOutputPredictor(modelName string) (types.OutputPredictor, error) {
+	predictor, ok := c.outputPredictors[modelName]
+	if !ok {
+		return nil, errNotImplemented
+	}
+	return predictor, nil
+}
+
+func (c *SimpleCache) SetOutputPredictor(modelName string, predictor types.OutputPredictor) {
+	c.outputPredictors[modelName] = predictor
 }
 
 // SimplePodList is a simplified implementation of PodList for testing
@@ -185,6 +210,50 @@ func TestVTCRouterSimple(t *testing.T) {
 	assert.NotEmpty(t, selectedPodAddress)
 	// Check if the selected pod address is one of the expected IP addresses with port
 	assert.Contains(t, []string{"192.168.1.1:8000", "192.168.1.2:8000", "192.168.1.3:8000"}, selectedPodAddress)
+}
+
+func TestVTCRouterPredUsesPredictor(t *testing.T) {
+	trackerConfig := &VTCConfig{
+		InputTokenWeight:  1.0,
+		OutputTokenWeight: 1.0,
+		Variant:           RouterVTCPred,
+	}
+	tokenTracker := NewInMemorySlidingWindowTokenTracker(trackerConfig, WithWindowSize(100), WithTimeUnit(Milliseconds))
+	tokenEstimator := NewSimpleTokenEstimator()
+	cache := NewSimpleCache()
+	cache.SetOutputPredictor("model1", &fixedOutputPredictor{output: 10})
+
+	routerConfig := &VTCConfig{
+		InputTokenWeight:  1.0,
+		OutputTokenWeight: 1.0,
+		Variant:           RouterVTCPred,
+	}
+	router := &BasicVTCRouter{
+		cache:                   cache,
+		outputPredictorProvider: cache,
+		tokenTracker:            tokenTracker,
+		tokenEstimator:          tokenEstimator,
+		config:                  routerConfig,
+	}
+
+	pods := createTestPods(3)
+	podList := NewSimplePodList(pods)
+
+	ctx := context.Background()
+	user := "user1"
+	err := tokenTracker.UpdateTokenCount(ctx, user, 0, 0)
+	assert.NoError(t, err)
+
+	routingCtx := types.NewRoutingContext(ctx, "vtc-pred", "model1", "test message", "request1", user)
+	_, err = router.Route(routingCtx, podList)
+	assert.NoError(t, err)
+
+	promptLen, err := routingCtx.PromptLength()
+	assert.NoError(t, err)
+
+	tokens, err := tokenTracker.GetTokenCount(ctx, user)
+	assert.NoError(t, err)
+	assert.Equal(t, float64(promptLen+10), tokens)
 }
 
 func TestVTCBasicRouterStrengths(t *testing.T) {
@@ -374,8 +443,9 @@ func TestVTCBasicRouterStrengths(t *testing.T) {
 		}
 	})
 
-	// Clamp fairness when tokens exceed adaptive bucket*(nPods-1)
-	t.Run("ClampedFairnessHighTokens", func(t *testing.T) {
+	// Wrapped mapping should NOT saturate to the last pod.
+	// With high tokens, normalizedTokens wraps around the ring, and the closest pod should be selected.
+	t.Run("WrappedFairnessHighTokens", func(t *testing.T) {
 		highTracker := NewInMemorySlidingWindowTokenTracker(trackerConfig)
 		highRouter := &BasicVTCRouter{cache: cache, tokenTracker: highTracker, tokenEstimator: tokenEstimator, config: routerConfig}
 		podsHigh := createTestPods(3)
@@ -385,12 +455,14 @@ func TestVTCBasicRouterStrengths(t *testing.T) {
 			podKey := utils.GeneratePodKey("default", fmt.Sprintf("pod%d", i))
 			cache.SetPodMetric(podKey, "model1", metrics.NumRequestsRunning, 0)
 		}
-		// Use tokens > adaptiveBucket*2 to clamp normalizedTokens to last index=2
+		// Use a high token count to exercise wrap-around behavior.
 		_ = highTracker.UpdateTokenCount(ctx, "highUser", 10000, 0)
 		addr, err := highRouter.Route(types.NewRoutingContext(ctx, "vtc-basic", "model1", "test", "req-high", "highUser"), highList)
 		assert.NoError(t, err)
-		// Should select middle pod (index 1) due to clamped fairness index
-		assert.Equal(t, "192.168.1.2:8000", addr, "High tokens clamp fairness to middle pod index")
+		// In this test the tracker observes only one user (min=max=10000),
+		// so adaptiveBucketSize becomes 10000 and normalizedTokens = 1.
+		// The closest pod on the ring is index 1.
+		assert.Equal(t, "192.168.1.2:8000", addr, "High tokens should route to the nearest pod on the ring")
 	})
 
 	// Random fallback when user is nil

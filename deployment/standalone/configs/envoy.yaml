@@ -67,21 +67,21 @@ static_resources:
                         - match:
                             prefix: "/v1/chat/completions"
                           route:
-                            cluster: vllm_backend
+                            cluster_header: target-cluster
                             timeout: 600s
                             idle_timeout: 300s
 
                         - match:
                             prefix: "/v1/completions"
                           route:
-                            cluster: vllm_backend
+                            cluster_header: target-cluster
                             timeout: 600s
                             idle_timeout: 300s
 
                         - match:
                             prefix: "/v1/embeddings"
                           route:
-                            cluster: vllm_backend
+                            cluster_header: target-cluster
                             timeout: 120s
 
                         # ============================================
@@ -112,9 +112,10 @@ static_resources:
 
                         - match:
                             prefix: "/health"
-                          route:
-                            cluster: vllm_backend
-                            timeout: 10s
+                          direct_response:
+                            status: 200
+                            body:
+                              inline_string: '{"status":"ok"}'
 
                         - match:
                             prefix: "/healthz"
@@ -132,7 +133,7 @@ static_resources:
                         - match:
                             prefix: "/v1/"
                           route:
-                            cluster: vllm_backend
+                            cluster_header: target-cluster
                             timeout: 120s
 
                         - match:
@@ -163,6 +164,7 @@ static_resources:
                       message_timeout: 30s
                       failure_mode_allow: false
 
+
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -187,9 +189,9 @@ static_resources:
               - endpoint:
                   address:
                     socket_address:
-                      # Docker service name for container networking
-                      address: gateway
-                      port_value: 50052
+                      # Local dev: gateway-plugins runs on host
+                      address: host.docker.internal
+                      port_value: 15052
       health_checks:
         - timeout: 5s
           interval: 10s
@@ -212,9 +214,75 @@ static_resources:
               - endpoint:
                   address:
                     socket_address:
-                      # Docker service name for container networking
-                      address: gateway
-                      port_value: 8080
+                      # Local dev: gateway-plugins runs on host
+                      address: host.docker.internal
+                      port_value: 18081
+      connect_timeout: 5s
+
+    # ============================================
+    # Standalone Backends (CPU-only / local dev)
+    # gateway-plugin 会在响应里写入 header: target-cluster=standalone_backend_<i>
+    # Envoy 通过 route.cluster_header 选择目标 cluster。
+    # ============================================
+
+    - name: standalone_backend_0
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: standalone_backend_0
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: host.docker.internal
+                      port_value: 8001
+      connect_timeout: 5s
+
+    - name: standalone_backend_1
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: standalone_backend_1
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: host.docker.internal
+                      port_value: 8002
+      connect_timeout: 5s
+
+    - name: standalone_backend_2
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: standalone_backend_2
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: host.docker.internal
+                      port_value: 8003
+      connect_timeout: 5s
+
+    - name: standalone_backend_3
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: standalone_backend_3
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: host.docker.internal
+                      port_value: 8004
       connect_timeout: 5s
 
     # ============================================

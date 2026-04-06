@@ -18,6 +18,7 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -43,6 +44,12 @@ func CheckUser(ctx context.Context, u User, redisClient *redis.Client) bool {
 func GetUser(ctx context.Context, u User, redisClient *redis.Client) (User, error) {
 	val, err := redisClient.Get(ctx, genKey(u.Name)).Result()
 	if err != nil {
+		// Treat Redis key-miss as "user not configured" and fallback to a default user.
+		// This avoids failing requests when the `user` header is present but the user
+		// store is empty (common in local dev / benchmark scenarios).
+		if errors.Is(err, redis.Nil) {
+			return User{Name: u.Name}, nil
+		}
 		return User{}, err
 	}
 	user := &User{}

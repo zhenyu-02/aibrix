@@ -24,6 +24,7 @@ import (
 )
 
 const RouterVTCBasic types.RoutingAlgorithm = "vtc-basic"
+const RouterVTCPred types.RoutingAlgorithm = "vtc-pred"
 
 // TODO: add other variants - "vtc-fair", "vtc-max-fair", "vtc-pred-50"
 
@@ -62,6 +63,15 @@ func DefaultVTCConfig() VTCConfig {
 
 func NewVTCBasicRouter() (types.Router, error) {
 	config := DefaultVTCConfig()
+	configPtr := &config
+	var tokenEstimator TokenEstimator = NewSimpleTokenEstimator()
+	var tokenTracker TokenTracker = NewInMemorySlidingWindowTokenTracker(configPtr)
+	return NewBasicVTCRouter(tokenTracker, tokenEstimator, configPtr)
+}
+
+func NewVTCPredRouter() (types.Router, error) {
+	config := DefaultVTCConfig()
+	config.Variant = RouterVTCPred
 	configPtr := &config
 	var tokenEstimator TokenEstimator = NewSimpleTokenEstimator()
 	var tokenTracker TokenTracker = NewInMemorySlidingWindowTokenTracker(configPtr)

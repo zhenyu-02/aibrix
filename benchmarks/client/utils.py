@@ -1,6 +1,7 @@
 import json
 import openai
 import threading
+import os
 from typing import List, Any, Dict
 
 def load_workload(input_path: str) -> List[Any]:
@@ -76,21 +77,42 @@ def create_client(api_key: str,
                   timeout: float,
                   routing_strategy: str,
                   ):
-    if api_key is None:
-        client = openai.AsyncOpenAI(
-            base_url=endpoint + "/v1",
-            max_retries=max_retries,
-            timeout=timeout,
-        )
-    else:
-        client = openai.AsyncOpenAI(
-            api_key=api_key,
-            base_url=endpoint + "/v1",
-            max_retries=max_retries,
-            timeout=timeout,
-        )
+    # openai>=1.x 强制要求 api_key 非空；本地/CPU-only bench 走的是兼容 OpenAI 的 mock 服务，
+    # 因此默认填一个占位 key，避免调用方必须配置环境变量。
+    effective_key = api_key or os.getenv("OPENAI_API_KEY") or "EMPTY"
+    client = openai.AsyncOpenAI(
+        api_key=effective_key,
+        base_url=endpoint + "/v1",
+        max_retries=max_retries,
+        timeout=timeout,
+    )
     if routing_strategy is not None:
         client = client.with_options(
             default_headers={"routing-strategy": routing_strategy}
         )
     return client
+
+
+def pick_user_for_request(request: Dict, request_id: int, user_count: int) -> str:
+    """为请求挑选一个 user（用于网关侧按用户统计/路由）。
+
+    优先级：
+    1) workload/request 里显式带了 user 字段
+    2) sessioned workload：用 session_id 做稳定映射
+    3) 否则按 request_id 取模
+    """
+    if request is None:
+        return f"user-{request_id % user_count}"
+
+    explicit = request.get("user")
+    if explicit:
+        return str(explicit)
+
+    session_id = request.get("session_id")
+    if session_id is not None:
+        try:
+            return f"user-{int(session_id) % user_count}"
+        except Exception:
+            return f"user-{request_id % user_count}"
+
+    return f"user-{request_id % user_count}"

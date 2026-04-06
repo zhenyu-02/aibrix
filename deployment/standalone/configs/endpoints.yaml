@@ -11,4 +11,11 @@
 models:
   - name: "Qwen/Qwen2.5-1.5B-Instruct"
     endpoints:
-      - address: "vllm:8000"
+      # CPU-only / local dev:
+      # - gateway-plugin 会把 address 的 host 当作“PodIP”，并在响应头 target-pod 里回传 "host:port"
+      # - Envoy dynamic_forward_proxy 会对 target-pod 做 DNS 解析并转发
+      # 因此 host 必须对 Envoy 容器可解析（macOS/Windows 上通常用 host.docker.internal）。
+      - address: "host.docker.internal:8001"
+      - address: "host.docker.internal:8002"
+      - address: "host.docker.internal:8003"
+      - address: "host.docker.internal:8004"

@@ -103,7 +103,14 @@ func (s *Server) HandleRequestBody(ctx context.Context, requestID string, req *e
 		klog.InfoS("request start", "requestID", requestID, "requestPath", requestPath, "model", model, "stream", stream)
 	} else {
 		externalFilter := routingCtx.ReqHeaders[HeaderExternalFilter]
-		targetPodIP, err := s.selectTargetPod(routingCtx, podsArr, externalFilter)
+		// If target pod has already been selected (e.g., from request headers), reuse it.
+		targetPodIP := ""
+		var err error
+		if routingCtx.HasRouted() {
+			targetPodIP = routingCtx.TargetAddress()
+		} else {
+			targetPodIP, err = s.selectTargetPod(routingCtx, podsArr, externalFilter)
+		}
 		if targetPodIP == "" || err != nil {
 			klog.ErrorS(err, "failed to select target pod", "requestID", requestID, "routingStrategy", routingAlgorithm, "model", model, "routingDuration", routingCtx.GetRoutingDelay())
 			return generateErrorResponse(
@@ -113,6 +120,14 @@ func (s *Server) HandleRequestBody(ctx context.Context, requestID string, req *e
 				"error on selecting target pod", ErrorCodeServiceUnavailable, ""), model, routingCtx, stream, term
 		}
 		headers = buildEnvoyProxyHeaders(headers,
+			HeaderTargetCluster, func() string {
+				if routingCtx.HasRouted() {
+					if p := routingCtx.TargetPod(); p != nil {
+						return p.Labels["aibrix.ai/standalone-cluster"]
+					}
+				}
+				return ""
+			}(),
 			HeaderRoutingStrategy, string(routingAlgorithm),
 			HeaderTargetPod, targetPodIP,
 			"content-length", strconv.Itoa(len(routingCtx.ReqBody)),
@@ -130,6 +145,9 @@ func (s *Server) HandleRequestBody(ctx context.Context, requestID string, req *e
 					HeaderMutation: &extProcPb.HeaderMutation{
 						SetHeaders: headers,
 					},
+					// We may rewrite ":authority"/"host" (dynamic forward proxy) and ":path".
+					// Clear route cache so Envoy re-evaluates routing with mutated headers.
+					ClearRouteCache: true,
 					BodyMutation: &extProcPb.BodyMutation{
 						Mutation: &extProcPb.BodyMutation_Body{
 							Body: routingCtx.ReqBody,
